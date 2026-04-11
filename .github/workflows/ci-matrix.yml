@@ -12,6 +12,7 @@ on:
 permissions:
   packages: write
   contents: read
+  actions: read
 
 env:
   OMP_NUM_THREADS: 2
@@ -174,3 +175,167 @@ jobs:
           uv run pytest
         env:
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
+  release-build:
+    name: "Release build (${{ matrix.os }}, ${{ matrix.compiler }})"
+    # Skip on PRs — release artifacts are only needed on main and manual runs.
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            compiler: llvm-20
+            runner: ubuntu-latest
+            cc: clang-20
+            cxx: clang++-20
+            artifact_name: icebug-linux-x86_64
+            archive: icebug-linux-x86_64.tar.gz
+          - os: macos
+            compiler: llvm-20
+            runner: macos-latest
+            cc: /opt/homebrew/opt/llvm@20/bin/clang
+            cxx: /opt/homebrew/opt/llvm@20/bin/clang++
+            artifact_name: icebug-macos-arm64
+            archive: icebug-macos-arm64.tar.gz
+          - os: windows
+            compiler: msvc
+            runner: windows-2022
+            cc: cl
+            cxx: cl
+            artifact_name: icebug-win-amd64
+            archive: icebug-win-amd64.zip
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install prerequisites (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc
+          echo "deb http://apt.llvm.org/noble llvm-toolchain-noble-20 main" | sudo tee /etc/apt/sources.list.d/llvm20.list
+          wget https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-noble.deb
+          sudo apt-get install -y ./apache-arrow-apt-source-latest-noble.deb
+          sudo apt-get update
+          sudo apt-get install -y clang-20 libomp-20-dev ninja-build libarrow-dev
+
+      - name: Install prerequisites (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          brew install apache-arrow libomp
+          brew reinstall llvm@20
+
+      - name: Create vcpkg manifest (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          cat > vcpkg.json << 'EOF'
+          {
+            "name": "networkit-deps",
+            "version": "1.0.0",
+            "dependencies": [
+              "arrow"
+            ]
+          }
+          EOF
+
+      - name: Setup vcpkg (Windows)
+        if: matrix.os == 'windows'
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 'b322364f06308bdd24823f9d8f03fe0cc86fd46f'
+
+      - name: Authenticate vcpkg NuGet (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $nuget = & $env:VCPKG_ROOT/vcpkg fetch nuget | Out-String
+          $nuget = $nuget.Trim()
+          & $nuget sources add -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" -Name "GitHubPackages" -Username "${{ github.repository_owner }}" -Password "${{ secrets.GITHUB_TOKEN }}" -StorePasswordInClearText -Verbosity detailed
+          & $nuget setapikey "${{ secrets.GITHUB_TOKEN }}" -Source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json"
+
+      - name: Install vcpkg packages (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          & $env:VCPKG_ROOT/vcpkg install --recurse --clean-after-build --triplet x64-windows
+        env:
+          VCPKG_BINARY_SOURCES: 'clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,readwrite'
+
+      - name: Setup devCmd (Windows)
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: release-${{ matrix.os }}-${{ matrix.compiler }}-${{ github.ref_name }}
+          restore-keys: |
+            release-${{ matrix.os }}-${{ matrix.compiler }}-
+          max-size: 2G
+
+      - name: Configure (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          cmake -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/dist \
+            -DNETWORKIT_MONOLITH=ON \
+            -DNETWORKIT_CXX_STANDARD=${{ env.CXX_STANDARD }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -B release_build -S .
+
+      - name: Configure (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          cmake -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/dist \
+            -DNETWORKIT_MONOLITH=ON \
+            -DNETWORKIT_CXX_STANDARD=${{ env.CXX_STANDARD }} \
+            -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/libomp \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -B release_build -S .
+
+      - name: Configure (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          cmake -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/dist" \
+            -DNETWORKIT_STATIC=ON \
+            -DNETWORKIT_MONOLITH=ON \
+            -DNETWORKIT_CXX_STANDARD=${{ env.CXX_STANDARD }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
+            -B release_build -S .
+        env:
+          VCPKG_BINARY_SOURCES: 'clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,readwrite'
+
+      - name: Build and install
+        run: cmake --build release_build --target install --config Release
+
+      - name: Create archive (Linux / macOS)
+        if: matrix.os != 'windows'
+        run: tar -czf ${{ matrix.archive }} -C dist .
+
+      - name: Create archive (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist\* -DestinationPath ${{ matrix.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-${{ github.run_id }}
+          path: ${{ matrix.archive }}
+          retention-days: 30

@@ -1,0 +1,64 @@
+name: Release Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to upload binaries to (e.g. 12.4)'
+        required: true
+        type: string
+      run_id:
+        description: 'ci-matrix.yml run ID to source artifacts from'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-binaries:
+    name: Upload binaries to release ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify run completed successfully
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          conclusion=$(gh run view ${{ inputs.run_id }} \
+            --repo ${{ github.repository }} \
+            --json conclusion \
+            --jq '.conclusion')
+          echo "Run ${{ inputs.run_id }} conclusion: $conclusion"
+          if [[ "$conclusion" != "success" ]]; then
+            echo "::error::Run ${{ inputs.run_id }} did not succeed (conclusion: $conclusion). Aborting."
+            exit 1
+          fi
+
+      - name: Download release artifacts from run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download ${{ inputs.run_id }} \
+            --repo ${{ github.repository }} \
+            --pattern 'icebug-*' \
+            --dir artifacts
+
+      - name: List downloaded files
+        run: find artifacts -type f | sort
+
+      - name: Upload binaries to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Each artifact is extracted into its own subdirectory; find the archives.
+          files=$(find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \))
+          if [[ -z "$files" ]]; then
+            echo "::error::No archives found under artifacts/. Check that run ${{ inputs.run_id }} produced icebug-* artifacts."
+            exit 1
+          fi
+          echo "Uploading:"
+          echo "$files"
+          gh release upload ${{ inputs.version }} \
+            $files \
+            --repo ${{ github.repository }} \
+            --clobber
