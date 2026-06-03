@@ -5,6 +5,7 @@
  */
 
 #include <networkit/community/ParallelLeidenView.hpp>
+#include <cstdint>
 #include <cstdlib>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -355,6 +356,8 @@ void ParallelLeidenView::flattenPartition() {
 
 template <typename GraphType>
 ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &graph) {
+    enum : uint8_t { Idle, Queued, Processing, Reprocess };
+
     DEBUG("Local Moving : ", graph.numberOfNodes(), " Nodes ");
     std::vector<count> moved(omp_get_max_threads(), 0);
     std::vector<count> movedToSingleton(omp_get_max_threads(), 0);
@@ -365,10 +368,11 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
     std::vector<count> totalNodesPerThread(omp_get_max_threads(), 0);
     std::atomic_int singleton(0);
 
-    // Only insert nodes to the queue when they're not already in it.
-    std::vector<std::atomic_bool> inQueue(graph.upperNodeIdBound());
-    for (auto &val : inQueue) {
-        val.store(false);
+    // Track whether nodes are idle, queued, currently processed, or need another pass after the
+    // current processing attempt finishes.
+    std::vector<std::atomic<uint8_t>> nodeState(graph.upperNodeIdBound());
+    for (auto &val : nodeState) {
+        val.store(Idle);
     }
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
@@ -405,13 +409,64 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
         // Sparse cutWeight[Community] storage avoids one dense community vector per thread.
         std::unordered_map<index, double> cutWeights;
         std::vector<index> pointers;
+
+        auto pushNewNode = [&](node queuedNode) {
+            newNodes.push_back(queuedNode);
+            // push new nodes to the queue in WORKING_SIZE steps
+            if (newNodes.size() == WORKING_SIZE) {
+                qlock.lock();
+                queue.emplace(std::move(newNodes));
+                qlock.unlock();
+                // Notify threads that new is available
+                workAvailable.notify_all();
+                newNodes.clear();
+                newNodes.reserve(WORKING_SIZE);
+            }
+        };
+
+        auto scheduleNode = [&](node queuedNode) {
+            uint8_t state = nodeState[queuedNode].load();
+            while (true) {
+                if (state == Idle) {
+                    uint8_t expected = Idle;
+                    if (nodeState[queuedNode].compare_exchange_strong(expected, Queued)) {
+                        pushNewNode(queuedNode);
+                        return;
+                    }
+                    state = expected;
+                } else if (state == Processing) {
+                    uint8_t expected = Processing;
+                    if (nodeState[queuedNode].compare_exchange_strong(expected, Reprocess)) {
+                        return;
+                    }
+                    state = expected;
+                } else {
+                    return;
+                }
+            }
+        };
+
+        auto finishProcessingNode = [&](node processedNode) {
+            uint8_t expected = Processing;
+            if (nodeState[processedNode].compare_exchange_strong(expected, Idle)) {
+                return;
+            }
+            assert(expected == Reprocess);
+            expected = Reprocess;
+            const bool markedQueued =
+                nodeState[processedNode].compare_exchange_strong(expected, Queued);
+            assert(markedQueued);
+            tlx::unused(markedQueued);
+            pushNewNode(processedNode);
+        };
+
         int start = tshare * order[omp_get_thread_num()];
         int end = (1 + order[omp_get_thread_num()]) * tshare;
 
         for (int i = start; i < end; i++) {
             if (graph.hasNode(i)) {
                 currentNodes.push_back(i);
-                inQueue[i].store(true);
+                nodeState[i].store(Queued);
             }
         }
         if (random)
@@ -428,7 +483,11 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     }
                     waitingForResize--;
                 }
-                assert(inQueue[u]);
+                uint8_t expectedState = Queued;
+                const bool startedProcessing =
+                    nodeState[u].compare_exchange_strong(expectedState, Processing);
+                assert(startedProcessing);
+                tlx::unused(startedProcessing);
                 index currentCommunity = result[u];
                 double maxDelta = std::numeric_limits<double>::lowest();
                 index bestCommunity = none;
@@ -453,8 +512,10 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     degree += ew; // keep track of the nodes degree. Loops count twice
                 });
 
-                if (pointers.empty())
+                if (pointers.empty()) {
+                    finishProcessingNode(u);
                     continue;
+                }
 
                 double singletonScore = scoreCommunity(0.0, degree, 0.0, nodeMass, 0);
 
@@ -494,73 +555,57 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     }
 
                     if (acceptedMove) {
-                    const int tid = omp_get_thread_num();
-                    moved[tid]++;
-                    if (singletonMove) { // move node to empty community
-                        singleton++;
-                        movedToSingleton[tid]++;
-                        bestCommunity = upperBound++;
-                        if (bestCommunity >= communityVolumes.size()) {
-                            // Wait until all other threads yielded, then increase vector size
-                            bool expected = false;
-                            if (resize.compare_exchange_strong(expected, true)) {
-                                vectorSize += VECTOR_OVERSIZE;
-                                while (waitingForResize < tcount - 1) {
-                                    std::this_thread::yield();
+                        const int tid = omp_get_thread_num();
+                        moved[tid]++;
+                        if (singletonMove) { // move node to empty community
+                            singleton++;
+                            movedToSingleton[tid]++;
+                            bestCommunity = upperBound++;
+                            if (bestCommunity >= communityVolumes.size()) {
+                                // Wait until all other threads yielded, then increase vector size
+                                bool expected = false;
+                                if (resize.compare_exchange_strong(expected, true)) {
+                                    vectorSize += VECTOR_OVERSIZE;
+                                    while (waitingForResize < tcount - 1) {
+                                        std::this_thread::yield();
+                                    }
+                                    // all other threads are yielding, so resize is fine
+                                    communityVolumes.resize(vectorSize);
+                                    communitySizes.resize(vectorSize);
+                                    expected = true;
+                                    resize.compare_exchange_strong(expected, false);
+                                } else {
+                                    waitingForResize++;
+                                    while (resize) {
+                                        std::this_thread::yield();
+                                    }
+                                    waitingForResize--;
                                 }
-                                // all other threads are yielding, so resize is fine
-                                communityVolumes.resize(vectorSize);
-                                communitySizes.resize(vectorSize);
-                                expected = true;
-                                resize.compare_exchange_strong(expected, false);
-                            } else {
-                                waitingForResize++;
-                                while (resize) {
-                                    std::this_thread::yield();
-                                }
-                                waitingForResize--;
                             }
                         }
-                    }
-                    gainMarginSum[tid] += gainMargin;
-                    gainMarginMin[tid] = std::min(gainMarginMin[tid], gainMargin);
-                    gainMarginMax[tid] = std::max(gainMarginMax[tid], gainMargin);
-                    result[u] = bestCommunity;
+                        gainMarginSum[tid] += gainMargin;
+                        gainMarginMin[tid] = std::min(gainMarginMin[tid], gainMargin);
+                        gainMarginMax[tid] = std::max(gainMarginMax[tid], gainMargin);
+                        result[u] = bestCommunity;
 #pragma omp atomic
-                    communityVolumes[bestCommunity] += degree;
+                        communityVolumes[bestCommunity] += degree;
 #pragma omp atomic
-                    communityVolumes[currentCommunity] -= degree;
+                        communityVolumes[currentCommunity] -= degree;
 #pragma omp atomic
-                    communitySizes[bestCommunity] += nodeMass;
+                        communitySizes[bestCommunity] += nodeMass;
 #pragma omp atomic
-                    communitySizes[currentCommunity] -= nodeMass;
-                    changed = true;
-                    bool expected = true;
-                    inQueue[u].compare_exchange_strong(expected, false);
-                    assert(expected);
-                    graph.forNeighborsOf(u, [&](node neighbor, edgeweight) {
-                        // Only add the node to the queue if it's not already
-                        // in it, and it's not the Node we're currently moving
-                        if (result[neighbor] != bestCommunity && neighbor != u) {
-                            expected = false;
-                            if (inQueue[neighbor].compare_exchange_strong(expected, true)) {
-                                newNodes.push_back(neighbor);
-                                // push new nodes to the queue in WORKING_SIZE steps
-                                if (newNodes.size() == WORKING_SIZE) {
-                                    qlock.lock();
-                                    queue.emplace(std::move(newNodes));
-                                    qlock.unlock();
-                                    // Notify threads that new is available
-                                    workAvailable.notify_all();
-                                    newNodes.clear();
-                                    newNodes.reserve(WORKING_SIZE);
-                                }
-                                assert(!expected);
+                        communitySizes[currentCommunity] -= nodeMass;
+                        changed = true;
+                        graph.forNeighborsOf(u, [&](node neighbor, edgeweight) {
+                            // Only add the node to the queue if it's not already
+                            // in it, and it's not the Node we're currently moving
+                            if (result[neighbor] != bestCommunity && neighbor != u) {
+                                scheduleNode(neighbor);
                             }
-                        }
-                    });
+                        });
                     } // if (acceptedMove)
                 }
+                finishProcessingNode(u);
             }
 
             // queue check/wait
