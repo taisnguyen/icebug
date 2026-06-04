@@ -372,7 +372,7 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
     // current processing attempt finishes.
     std::vector<std::atomic<uint8_t>> nodeState(graph.upperNodeIdBound());
     for (auto &val : nodeState) {
-        val.store(Idle);
+        val.store(Idle, std::memory_order_relaxed);
     }
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
@@ -425,18 +425,26 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
         };
 
         auto scheduleNode = [&](node queuedNode) {
-            uint8_t state = nodeState[queuedNode].load();
+            uint8_t state = nodeState[queuedNode].load(std::memory_order_acquire);
             while (true) {
                 if (state == Idle) {
                     uint8_t expected = Idle;
-                    if (nodeState[queuedNode].compare_exchange_strong(expected, Queued)) {
+                    if (nodeState[queuedNode].compare_exchange_strong(
+                            expected,
+                            Queued,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
                         pushNewNode(queuedNode);
                         return;
                     }
                     state = expected;
                 } else if (state == Processing) {
                     uint8_t expected = Processing;
-                    if (nodeState[queuedNode].compare_exchange_strong(expected, Reprocess)) {
+                    if (nodeState[queuedNode].compare_exchange_strong(
+                            expected,
+                            Reprocess,
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
                         return;
                     }
                     state = expected;
@@ -448,13 +456,21 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
 
         auto finishProcessingNode = [&](node processedNode) {
             uint8_t expected = Processing;
-            if (nodeState[processedNode].compare_exchange_strong(expected, Idle)) {
+            if (nodeState[processedNode].compare_exchange_strong(
+                    expected,
+                    Idle,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
                 return;
             }
             assert(expected == Reprocess);
             expected = Reprocess;
             const bool markedQueued =
-                nodeState[processedNode].compare_exchange_strong(expected, Queued);
+                nodeState[processedNode].compare_exchange_strong(
+                    expected,
+                    Queued,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire);
             assert(markedQueued);
             tlx::unused(markedQueued);
             pushNewNode(processedNode);
@@ -466,7 +482,7 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
         for (int i = start; i < end; i++) {
             if (graph.hasNode(i)) {
                 currentNodes.push_back(i);
-                nodeState[i].store(Queued);
+                nodeState[i].store(Queued, std::memory_order_release);
             }
         }
         if (random)
@@ -485,7 +501,11 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                 }
                 uint8_t expectedState = Queued;
                 const bool startedProcessing =
-                    nodeState[u].compare_exchange_strong(expectedState, Processing);
+                    nodeState[u].compare_exchange_strong(
+                        expectedState,
+                        Processing,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire);
                 assert(startedProcessing);
                 tlx::unused(startedProcessing);
                 index currentCommunity = result[u];
