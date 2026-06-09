@@ -1,4 +1,6 @@
 networkit_add_test(structures CoverGTest auxiliary)
 networkit_add_test(structures PartitionGTest)
 networkit_add_test(structures UnionFindGTest)
+networkit_add_test(structures ConcurrentUnionFindGTest)
+networkit_add_test(structures LeastCommonAncestorGTest)
 

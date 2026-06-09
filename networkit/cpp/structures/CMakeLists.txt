@@ -3,6 +3,8 @@ networkit_add_module(structures
     LocalCommunity.cpp
     Partition.cpp
     UnionFind.cpp
+    ConcurrentUnionFind.cpp
+    LeastCommonAncestor.cpp
     )
 
 
