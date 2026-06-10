@@ -5,6 +5,8 @@
  *      Author: Ian Chen (ianchen3@illinois.edu)
  */
 
+#include <numeric>
+#include <vector>
 #include <gtest/gtest.h>
 #include <networkit/graph/GraphW.hpp>
 #include <networkit/scd/ShellStruct.hpp>
@@ -82,13 +84,8 @@ protected:
         return expectedCommunity;
     }
 
-    void verifySingletons(const std::vector<size_t> &cliques) {
-        GraphW g = getCliqueChain(cliques);
-        size_t n = g.numberOfNodes();
-
-        ShellStruct shell(g);
-        shell.build();
-
+    void verifySingletons(ShellStruct &shell, const std::vector<count> &cliques) {
+        count n = std::accumulate(cliques.begin(), cliques.end(), count(0));
         for (node v = 0; v < n; ++v) {
             std::set<node> query = {v};
             std::set<node> et = shell.expandOneCommunity(query);
@@ -98,13 +95,8 @@ protected:
         }
     }
 
-    void verifyPairs(const std::vector<size_t> &cliques) {
-        GraphW g = getCliqueChain(cliques);
-        size_t n = g.numberOfNodes();
-
-        ShellStruct shell(g);
-        shell.build();
-
+    void verifyPairs(ShellStruct &shell, const std::vector<count> &cliques) {
+        count n = std::accumulate(cliques.begin(), cliques.end(), count(0));
         for (node u = 0; u < n; ++u) {
             for (node v = u + 1; v < n; ++v) {
                 std::set<node> query = {u, v};
@@ -118,35 +110,79 @@ protected:
 };
 
 TEST_F(ShellStructGTest, SeparatedCores_Singleton) {
-    verifySingletons({4, 3, 4});
+    std::vector<count> cliques{4, 3, 4};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifySingletons(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, SeparatedCores_Pairs) {
-    verifyPairs({4, 3, 4});
+    std::vector<count> cliques{4, 3, 4};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifyPairs(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, BridgedCore_Singleton) {
-    verifySingletons({3, 4, 3});
+    std::vector<count> cliques{3, 4, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifySingletons(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, BridgedCore_Pairs) {
-    verifyPairs({3, 4, 3});
+    std::vector<count> cliques{3, 4, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifyPairs(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, Medium_Singleton) {
-    verifySingletons({3, 5, 4, 3, 6, 5, 4, 6, 3});
+    std::vector<count> cliques{3, 5, 4, 3, 6, 5, 4, 6, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifySingletons(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, Medium_Pairs) {
-    verifyPairs({3, 5, 4, 3, 6, 5, 4, 6, 3});
+    std::vector<count> cliques{3, 5, 4, 3, 6, 5, 4, 6, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifyPairs(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, Large_Singleton) {
-    verifySingletons({3, 4, 5, 6, 5, 4, 3, 5, 7, 9, 11, 9, 7, 5, 3, 4, 5, 6, 4, 3});
+    std::vector<count> cliques{3, 4, 5, 6, 5, 4, 3, 5, 7, 9, 11, 9, 7, 5, 3, 4, 5, 6, 4, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifySingletons(shell, cliques);
 }
 
 TEST_F(ShellStructGTest, LargePairs) {
-    verifyPairs({3, 4, 5, 6, 5, 4, 3, 5, 7, 9, 11, 9, 7, 5, 3, 4, 5, 6, 4, 3});
+    std::vector<count> cliques{3, 4, 5, 6, 5, 4, 3, 5, 7, 9, 11, 9, 7, 5, 3, 4, 5, 6, 4, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    verifyPairs(shell, cliques);
+}
+
+TEST_F(ShellStructGTest, LoadSave) {
+    std::vector<count> cliques{3, 4, 5, 6, 5, 4, 3, 5, 7, 9, 11, 9, 7, 5, 3, 4, 5, 6, 4, 3};
+    GraphW g = getCliqueChain(cliques);
+    ShellStruct shell(g);
+    shell.build();
+    shell.save("output/shellstruct_comp.parquet", "output/shellstruct_tree.parquet");
+
+    ShellStruct index(g);
+    index.load("output/shellstruct_comp.parquet", "output/shellstruct_tree.parquet");
+    verifyPairs(index, cliques);
 }
 
 } /* namespace NetworKit */

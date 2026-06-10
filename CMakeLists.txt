@@ -141,6 +141,7 @@ find_package(OpenMP)
 
 # Find Apache Arrow
 find_package(Arrow REQUIRED)
+find_package(Parquet REQUIRED)
 
 # FindOpenMP.cmake does not reliably find a user installed openmp library for clang/llvm on
 # both Linux- and macOS-systems (even for CMake Version >= 3.12). The following section
@@ -267,7 +268,7 @@ if(NETWORKIT_BUILD_CORE AND NETWORKIT_MONOLITH)
 		target_include_directories(networkit_state BEFORE PUBLIC "${PROJECT_SOURCE_DIR}/include")
 	endif()
 
-	target_link_libraries(networkit PRIVATE OpenMP::OpenMP_CXX PUBLIC tlx Arrow::arrow_shared)
+	target_link_libraries(networkit PRIVATE OpenMP::OpenMP_CXX PUBLIC tlx Arrow::arrow_shared Parquet::parquet_shared)
 	if(CMAKE_DL_LIBS)
 		target_link_libraries(networkit PRIVATE ${CMAKE_DL_LIBS})
 	endif()
@@ -336,7 +337,7 @@ if(NETWORKIT_PYTHON)
 			# target, so Arrow's include directories are not propagated transitively.
 			# Link Arrow::arrow_shared explicitly so the Cython extensions can find
 			# arrow headers (e.g. arrow/api.h) when building against an external core.
-			target_link_libraries(${TARGET_LIB} PRIVATE ${EXTERNAL_NETWORKIT_CORE} Arrow::arrow_shared)
+			target_link_libraries(${TARGET_LIB} PRIVATE ${EXTERNAL_NETWORKIT_CORE} Arrow::arrow_shared Parquet::parquet_shared)
 		else()
 			target_link_libraries(${TARGET_LIB} PRIVATE networkit)
 		endif()

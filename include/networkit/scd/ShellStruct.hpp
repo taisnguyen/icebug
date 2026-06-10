@@ -33,15 +33,18 @@ namespace NetworKit {
 class ShellStruct : public SelectiveCommunityDetector {
 
 private:
-    std::shared_ptr<arrow::LargeListArray> vertices; // tree nodes -> vertices
     std::shared_ptr<arrow::UInt64Array> assignment;  // vertices -> tree nodes
     std::shared_ptr<arrow::UInt64Array> coreness;    // tree nodes -> coreness
+    std::shared_ptr<arrow::LargeListArray> vertices; // tree nodes -> vertices
 
     bool built;
     std::optional<GraphR> tree;
+    std::shared_ptr<arrow::UInt64Array> treeIndptr;
+    std::shared_ptr<arrow::UInt64Array> treeIndices;
     std::unique_ptr<NetworKit::LeastCommonAncestor> lca;
 
-    arrow::Status saveInternal(const std::string &components_path, const std::string &tree_path);
+    arrow::Status saveInternal(const std::string &components_path, const std::string &tree_path,
+                               const std::string &compression);
     arrow::Status loadInternal(const std::string &components_path, const std::string &tree_path);
 
 public:
@@ -61,14 +64,19 @@ public:
     std::set<node> expandOneCommunity(const std::set<node> &s) override;
 
     /**
-     * @param[in]
+     * Saves the shellstruct index to disk in .parquet files.
+     *
+     * @param[in] components_path The assignment of vertices to components.
+     * @param[in] tree_path The coreness, vertices, and child structure of the tree.
      */
     void save(const std::string &components_path, const std::string &tree_path,
               const std::string &compression = "ZSTD") const;
 
     /**
+     * Loads the shellstruct index from disk via .parquet files.
      *
-     * @param[in]
+     * @param[in] components_path The assignment of vertices to components.
+     * @param[in] tree_path The coreness, vertices, and child structure of the tree.
      */
     void load(const std::string &components_path, const std::string &tree_path);
 

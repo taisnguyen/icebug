@@ -9,7 +9,12 @@
 #include <span>
 #include <stdexcept>
 
+#include <arrow/api.h>
 #include <arrow/array/builder_primitive.h>
+#include <arrow/io/file.h>
+#include <parquet/arrow/reader.h>
+#include <parquet/arrow/writer.h>
+#include <parquet/properties.h>
 #include <networkit/centrality/CoreDecomposition.hpp>
 #include <networkit/graph/BFS.hpp>
 #include <networkit/scd/SelectiveCommunityDetector.hpp>
@@ -215,9 +220,6 @@ void ShellStruct::build(const std::shared_ptr<arrow::UInt64Array> &coredecomp) {
 
     // Final Phase: convert to member types (LLM generated)
 
-    tree = GraphR(next_id, true, std::move(tree_c), std::move(tree_c_indptr));
-    lca = std::make_unique<NetworKit::LeastCommonAncestor>(*tree, root);
-
     auto make_arrow_array = [](auto vec) {
         using T = typename decltype(vec)::value_type;
         int64_t length = vec.size();
@@ -244,12 +246,17 @@ void ShellStruct::build(const std::shared_ptr<arrow::UInt64Array> &coredecomp) {
         }
     };
 
+    treeIndptr = make_arrow_array(std::move(tree_c_indptr));
+    treeIndices = make_arrow_array(std::move(tree_c));
+    tree = GraphR(next_id, true, treeIndices, treeIndptr);
+    lca = std::make_unique<NetworKit::LeastCommonAncestor>(*tree, root);
+
     std::vector<int64_t> offsets(tree_v_indptr.begin(), tree_v_indptr.end());
-    auto indptr_arr = make_arrow_array(std::move(offsets));
-    auto indices_arr = make_arrow_array(std::move(tree_v));
+    auto offsets_arr = make_arrow_array(std::move(offsets));
+    auto tree_v_arr = make_arrow_array(std::move(tree_v));
 
     vertices = std::static_pointer_cast<arrow::LargeListArray>(
-        arrow::LargeListArray::FromArrays(*indptr_arr, *indices_arr).ValueOrDie());
+        arrow::LargeListArray::FromArrays(*offsets_arr, *tree_v_arr).ValueOrDie());
     assignment = make_arrow_array(std::move(assignment_vec));
     coreness = make_arrow_array(std::move(coreness_vec));
 
@@ -282,15 +289,149 @@ std::set<node> ShellStruct::expandOneCommunity(const std::set<node> &s) {
     return std::set<node>(output.begin(), output.end());
 }
 
-// TODO
-// void ShellStruct::save(const std::string &components_path, const std::string &tree_path,
-//                        const std::string &compression) const {
-//     INFO("calling ShellStruct::save");
-// }
+static parquet::WriterProperties::Builder writerPropsBuilder(const std::string &compression) {
+    parquet::WriterProperties::Builder b;
+    if (compression == "ZSTD")
+        b.compression(parquet::Compression::ZSTD);
+    else if (compression == "SNAPPY")
+        b.compression(parquet::Compression::SNAPPY);
+    else if (compression == "GZIP")
+        b.compression(parquet::Compression::GZIP);
+    else if (compression == "NONE")
+        b.compression(parquet::Compression::UNCOMPRESSED);
+    else
+        throw std::runtime_error("ShellStruct::save — unknown compression: " + compression);
+    return b;
+}
 
-// TODO
-// void ShellStruct::load(const std::string &components_path, const std::string &tree_path) {
-//     INFO("calling ShellStruct::save");
-// }
+static arrow::Status writeTable(const std::shared_ptr<arrow::Table> &table, const std::string &path,
+                                const std::string &compression) {
+    ARROW_ASSIGN_OR_RAISE(auto sink, arrow::io::FileOutputStream::Open(path));
+    auto writerProps = writerPropsBuilder(compression).build();
+    auto arrowProps = parquet::ArrowWriterProperties::Builder().store_schema()->build();
+    ARROW_RETURN_NOT_OK(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink,
+                                                   1 << 20, writerProps, arrowProps));
+    return sink->Close();
+}
+
+static arrow::Status readTable(const std::string &path, std::shared_ptr<arrow::Table> *out) {
+    ARROW_ASSIGN_OR_RAISE(auto src, arrow::io::ReadableFile::Open(path));
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    ARROW_ASSIGN_OR_RAISE(reader, parquet::arrow::OpenFile(src, arrow::default_memory_pool()));
+    return reader->ReadTable(out);
+}
+
+arrow::Status ShellStruct::saveInternal(const std::string &components_path,
+                                        const std::string &tree_path,
+                                        const std::string &compression) {
+    {
+        auto schema = arrow::schema({arrow::field("assignment", arrow::uint64())});
+        auto table = arrow::Table::Make(schema, {assignment});
+        ARROW_RETURN_NOT_OK(writeTable(table, components_path, compression));
+    }
+    {
+        auto schema = arrow::schema({
+            arrow::field("coreness", arrow::uint64()),
+            arrow::field("vertices", arrow::large_list(arrow::uint64())),
+            arrow::field("csr_indptr", arrow::uint64()),
+            arrow::field("csr_indices", arrow::uint64()),
+        });
+        auto indptr = std::static_pointer_cast<arrow::UInt64Array>(
+            treeIndptr->Slice(0, treeIndptr->length() - 1));
+        arrow::UInt64Builder builder;
+        ARROW_RETURN_NOT_OK(builder.AppendValues(treeIndices->raw_values(), treeIndices->length()));
+        ARROW_RETURN_NOT_OK(builder.AppendNull());
+        std::shared_ptr<arrow::Array> indices;
+        ARROW_RETURN_NOT_OK(builder.Finish(&indices));
+        auto table = arrow::Table::Make(schema, {
+                                                    std::make_shared<arrow::ChunkedArray>(coreness),
+                                                    std::make_shared<arrow::ChunkedArray>(vertices),
+                                                    std::make_shared<arrow::ChunkedArray>(indptr),
+                                                    std::make_shared<arrow::ChunkedArray>(indices),
+                                                });
+        ARROW_RETURN_NOT_OK(writeTable(table, tree_path, compression));
+    }
+    return arrow::Status::OK();
+}
+
+arrow::Status ShellStruct::loadInternal(const std::string &components_path,
+                                        const std::string &tree_path) {
+    {
+        std::shared_ptr<arrow::Table> table;
+        ARROW_RETURN_NOT_OK(readTable(components_path, &table));
+
+        auto col = table->GetColumnByName("assignment");
+        if (!col)
+            return arrow::Status::Invalid("components file missing 'assignment' column");
+        ARROW_ASSIGN_OR_RAISE(auto combined,
+                              arrow::Concatenate(col->chunks(), arrow::default_memory_pool()));
+        assignment = std::static_pointer_cast<arrow::UInt64Array>(combined);
+    }
+
+    {
+        std::shared_ptr<arrow::Table> table;
+        ARROW_RETURN_NOT_OK(readTable(tree_path, &table));
+
+        auto load_uint64 = [&](const std::string &name,
+                               std::shared_ptr<arrow::UInt64Array> &out) -> arrow::Status {
+            auto col = table->GetColumnByName(name);
+            if (!col)
+                return arrow::Status::Invalid("tree file missing '" + name + "' column");
+            ARROW_ASSIGN_OR_RAISE(auto combined,
+                                  arrow::Concatenate(col->chunks(), arrow::default_memory_pool()));
+            out = std::static_pointer_cast<arrow::UInt64Array>(combined);
+            return arrow::Status::OK();
+        };
+
+        std::shared_ptr<arrow::UInt64Array> indptr, indices;
+        ARROW_RETURN_NOT_OK(load_uint64("coreness", coreness));
+        ARROW_RETURN_NOT_OK(load_uint64("csr_indptr", indptr));
+        ARROW_RETURN_NOT_OK(load_uint64("csr_indices", indices));
+        treeIndices =
+            std::static_pointer_cast<arrow::UInt64Array>(indices->Slice(0, indices->length() - 1));
+        arrow::UInt64Builder builder;
+        ARROW_RETURN_NOT_OK(builder.AppendValues(indptr->raw_values(), indptr->length()));
+        ARROW_RETURN_NOT_OK(builder.Append(treeIndices->length()));
+        ARROW_RETURN_NOT_OK(builder.Finish(&treeIndptr));
+        {
+            auto col = table->GetColumnByName("vertices");
+            if (!col)
+                return arrow::Status::Invalid("tree file missing 'vertices' column");
+            ARROW_ASSIGN_OR_RAISE(auto combined,
+                                  arrow::Concatenate(col->chunks(), arrow::default_memory_pool()));
+            vertices = std::static_pointer_cast<arrow::LargeListArray>(combined);
+        }
+
+        count n = treeIndptr->length() - 1;
+        tree.emplace(n, true, treeIndices, treeIndptr);
+
+        node root = none;
+        for (node v = 0; v < n && root == none; ++v)
+            if (coreness->Value(v) == 0)
+                root = v;
+
+        GraphR nkTree(n, true, treeIndices, treeIndptr);
+        lca = std::make_unique<NetworKit::LeastCommonAncestor>(nkTree, root);
+    }
+
+    built = true;
+    return arrow::Status::OK();
+}
+
+void ShellStruct::save(const std::string &components_path, const std::string &tree_path,
+                       const std::string &compression) const {
+    if (!built)
+        throw std::runtime_error("ShellStruct::save called before build()");
+    auto status =
+        const_cast<ShellStruct *>(this)->saveInternal(components_path, tree_path, compression);
+    if (!status.ok())
+        throw std::runtime_error("ShellStruct::save failed: " + status.ToString());
+}
+
+void ShellStruct::load(const std::string &components_path, const std::string &tree_path) {
+    auto status = loadInternal(components_path, tree_path);
+    if (!status.ok())
+        throw std::runtime_error("ShellStruct::load failed: " + status.ToString());
+}
 
 } // namespace NetworKit
