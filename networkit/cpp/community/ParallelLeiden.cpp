@@ -1,4 +1,5 @@
 #include <networkit/community/ParallelLeiden.hpp>
+#include <cstdint>
 
 namespace NetworKit {
 ParallelLeiden::ParallelLeiden(const Graph &graph, int iterations, bool randomize, double gamma)
@@ -122,16 +123,19 @@ void ParallelLeiden::flattenPartition() {
 }
 
 void ParallelLeiden::parallelMove(const Graph &graph) {
+    enum : uint8_t { Idle, Queued, Processing, Reprocess };
+
     DEBUG("Local Moving : ", graph.numberOfNodes(), " Nodes ");
     std::vector<count> moved(omp_get_max_threads(), 0);
     std::vector<count> totalNodesPerThread(omp_get_max_threads(), 0);
     std::atomic_int singleton(0);
     //^^^ Debug stuff
 
-    // Only insert nodes to the queue when they're not already in it.
-    std::vector<std::atomic_bool> inQueue(graph.upperNodeIdBound());
-    for (auto &val : inQueue) {
-        val.store(false);
+    // Track whether nodes are idle, queued, currently processed, or need another pass after the
+    // current processing attempt finishes.
+    std::vector<std::atomic<uint8_t>> nodeState(graph.upperNodeIdBound());
+    for (auto &val : nodeState) {
+        val.store(Idle);
     }
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
@@ -167,13 +171,64 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
         // cutWeight[Community] returns cut of Node to Community
         std::vector<double> cutWeights(communityVolumes.capacity());
         std::vector<index> pointers;
+
+        auto pushNewNode = [&](node queuedNode) {
+            newNodes.push_back(queuedNode);
+            // push new nodes to the queue in WORKING_SIZE steps
+            if (newNodes.size() == WORKING_SIZE) {
+                qlock.lock();
+                queue.emplace(std::move(newNodes));
+                qlock.unlock();
+                // Notify threads that new is available
+                workAvailable.notify_all();
+                newNodes.clear();
+                newNodes.reserve(WORKING_SIZE);
+            }
+        };
+
+        auto scheduleNode = [&](node queuedNode) {
+            uint8_t state = nodeState[queuedNode].load();
+            while (true) {
+                if (state == Idle) {
+                    uint8_t expected = Idle;
+                    if (nodeState[queuedNode].compare_exchange_strong(expected, Queued)) {
+                        pushNewNode(queuedNode);
+                        return;
+                    }
+                    state = expected;
+                } else if (state == Processing) {
+                    uint8_t expected = Processing;
+                    if (nodeState[queuedNode].compare_exchange_strong(expected, Reprocess)) {
+                        return;
+                    }
+                    state = expected;
+                } else {
+                    return;
+                }
+            }
+        };
+
+        auto finishProcessingNode = [&](node processedNode) {
+            uint8_t expected = Processing;
+            if (nodeState[processedNode].compare_exchange_strong(expected, Idle)) {
+                return;
+            }
+            assert(expected == Reprocess);
+            expected = Reprocess;
+            const bool markedQueued =
+                nodeState[processedNode].compare_exchange_strong(expected, Queued);
+            assert(markedQueued);
+            tlx::unused(markedQueued);
+            pushNewNode(processedNode);
+        };
+
         int start = tshare * order[omp_get_thread_num()];
         int end = (1 + order[omp_get_thread_num()]) * tshare;
 
         for (int i = start; i < end; i++) {
             if (graph.hasNode(i)) {
                 currentNodes.push_back(i);
-                inQueue[i].store(true);
+                nodeState[i].store(Queued);
             }
         }
         if (random)
@@ -192,7 +247,11 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                     waitingForResize--;
                 }
                 cutWeights.resize(vectorSize);
-                assert(inQueue[u]);
+                uint8_t expectedState = Queued;
+                const bool startedProcessing =
+                    nodeState[u].compare_exchange_strong(expectedState, Processing);
+                assert(startedProcessing);
+                tlx::unused(startedProcessing);
                 index currentCommunity = result[u];
                 double maxDelta = std::numeric_limits<double>::lowest();
                 index bestCommunity = none;
@@ -216,8 +275,10 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
                     degree += ew; // keep track of the nodes degree. Loops count twice
                 });
 
-                if (pointers.empty())
+                if (pointers.empty()) {
+                    finishProcessingNode(u);
                     continue;
+                }
 
                 // Determine Modularity delta for all neighbor communities
                 for (auto community : pointers) {
@@ -271,31 +332,15 @@ void ParallelLeiden::parallelMove(const Graph &graph) {
 #pragma omp atomic
                     communityVolumes[currentCommunity] -= degree;
                     changed = true;
-                    bool expected = true;
-                    inQueue[u].compare_exchange_strong(expected, false);
-                    assert(expected);
                     graph.forNeighborsOf(u, [&](node neighbor) {
                         // Only add the node to the queue if it's not already
                         // in it, and it's not the Node we're currently moving
                         if (result[neighbor] != bestCommunity && neighbor != u) {
-                            expected = false;
-                            if (inQueue[neighbor].compare_exchange_strong(expected, true)) {
-                                newNodes.push_back(neighbor);
-                                // push new nodes to the queue in WORKING_SIZE steps
-                                if (newNodes.size() == WORKING_SIZE) {
-                                    qlock.lock();
-                                    queue.emplace(std::move(newNodes));
-                                    qlock.unlock();
-                                    // Notify threads that new is available
-                                    workAvailable.notify_all();
-                                    newNodes.clear();
-                                    newNodes.reserve(WORKING_SIZE);
-                                }
-                                assert(!expected);
-                            }
+                            scheduleNode(neighbor);
                         }
                     });
                 }
+                finishProcessingNode(u);
             }
 
             // queue check/wait
