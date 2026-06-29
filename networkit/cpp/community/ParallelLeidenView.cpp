@@ -5,6 +5,7 @@
  */
 
 #include <networkit/community/ParallelLeidenView.hpp>
+#include <cstdint>
 #include <cstdlib>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -46,6 +47,16 @@ ParallelLeidenView::ParallelLeidenView(const Graph &graph, int iterations, bool 
             const int parsed = std::stoi(maxInnerEnv);
             if (parsed > 0) {
                 maxInnerIterations = parsed;
+            }
+        } catch (...) {
+            // Keep default if parsing fails.
+        }
+    }
+    if (const char *maxRequeuesPerNodeEnv = std::getenv("ICEBUG_LEIDEN_MAX_REQUEUES_PER_NODE")) {
+        try {
+            const int parsed = std::stoi(maxRequeuesPerNodeEnv);
+            if (parsed > 0) {
+                maxRequeuesPerNode = parsed;
             }
         } catch (...) {
             // Keep default if parsing fails.
@@ -166,6 +177,7 @@ void ParallelLeidenView::run() {
         changed = false;
         INFO("Using move gain epsilon=", std::setprecision(6), moveGainMarginEpsilon,
              " | max inner iterations=", maxInnerIterations,
+             " | max requeues per node=", maxRequeuesPerNode,
              " | vector oversize=", VECTOR_OVERSIZE,
              " | min community reduction=", minCommunityReduction);
 
@@ -228,10 +240,19 @@ void ParallelLeidenView::run() {
             handler.assureRunning();
 
             // Parallel refine phase
+            bool refineMadeChanges = false;
             if (currentCoarsenedView) {
-                refined = parallelRefine(*currentCoarsenedView);
+                refined = parallelRefine(*currentCoarsenedView, refineMadeChanges);
             } else {
-                refined = parallelRefine(*currentGraph);
+                refined = parallelRefine(*currentGraph, refineMadeChanges);
+            }
+
+            const bool zeroMoveAndRefinementMadeNoChanges = moveStats.moved == 0 && !refineMadeChanges;
+
+            if (zeroMoveAndRefinementMadeNoChanges) {
+                INFO("Stopping inner loop at inner iteration ", innerIterations,
+                        ": local moving made zero moves and refinement made no changes.");
+                break;
             }
 
             handler.assureRunning();
@@ -355,6 +376,8 @@ void ParallelLeidenView::flattenPartition() {
 
 template <typename GraphType>
 ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &graph) {
+    enum : uint8_t { Idle, Queued, Processing, Reprocess };
+
     DEBUG("Local Moving : ", graph.numberOfNodes(), " Nodes ");
     std::vector<count> moved(omp_get_max_threads(), 0);
     std::vector<count> movedToSingleton(omp_get_max_threads(), 0);
@@ -363,13 +386,21 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
     std::vector<double> gainMarginMin(omp_get_max_threads(), std::numeric_limits<double>::max());
     std::vector<double> gainMarginMax(omp_get_max_threads(), std::numeric_limits<double>::lowest());
     std::vector<count> totalNodesPerThread(omp_get_max_threads(), 0);
+    std::vector<count> requeuesBlockedByNodeLimit(omp_get_max_threads(), 0);
     std::atomic_int singleton(0);
 
-    // Only insert nodes to the queue when they're not already in it.
-    std::vector<std::atomic_bool> inQueue(graph.upperNodeIdBound());
-    for (auto &val : inQueue) {
-        val.store(false);
+    // Track whether nodes are idle, queued, currently processed, or need another pass after the
+    // current processing attempt finishes.
+    std::vector<std::atomic<uint8_t>> nodeState(graph.upperNodeIdBound());
+    for (auto &val : nodeState) {
+        val.store(Idle);
     }
+
+    std::vector<std::atomic<std::uint32_t>> requeuesPerNode(graph.upperNodeIdBound());
+    for (auto &count : requeuesPerNode) {
+        count.store(0);
+    }
+
     std::queue<std::vector<node>> queue;
     std::mutex qlock;                      // queue lock
     std::condition_variable workAvailable; // waiting/notifying for new Nodes
@@ -397,6 +428,8 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                 std::shuffle(order.begin(), order.end(), Aux::Random::getURNG());
             tshare = 1 + graph.upperNodeIdBound() / tcount;
         }
+
+        const int tid = omp_get_thread_num();
         auto &mt = Aux::Random::getURNG();
         std::vector<node> currentNodes;
         currentNodes.reserve(tshare);
@@ -405,13 +438,102 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
         // Sparse cutWeight[Community] storage avoids one dense community vector per thread.
         std::unordered_map<index, double> cutWeights;
         std::vector<index> pointers;
+
+        auto admitNodeRequeue = [&](node candidate) {
+            std::uint32_t used = requeuesPerNode[candidate].load(std::memory_order_relaxed);
+
+            while (true) {
+                if (used >= maxRequeuesPerNode) {
+                    requeuesBlockedByNodeLimit[tid]++;
+                    return false;
+                }
+
+                if (requeuesPerNode[candidate].compare_exchange_weak(
+                        used,
+                        used + 1,
+                        std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    return true;
+                }
+
+                // On CAS failure, `used` has been refreshed with the current value.
+            }
+        };
+
+        auto pushNewNode = [&](node queuedNode) {
+            newNodes.push_back(queuedNode);
+            // push new nodes to the queue in WORKING_SIZE steps
+            if (newNodes.size() == WORKING_SIZE) {
+                qlock.lock();
+                queue.emplace(std::move(newNodes));
+                qlock.unlock();
+                // Notify threads that new is available
+                workAvailable.notify_all();
+                newNodes.clear();
+                newNodes.reserve(WORKING_SIZE);
+            }
+        };
+
+        auto scheduleNode = [&](node queuedNode) {
+            std::uint8_t state = nodeState[queuedNode].load();
+
+            while (true) {
+                if (state == Idle) {
+                    std::uint8_t expected = Idle;
+
+                    if (nodeState[queuedNode].compare_exchange_strong(expected, Queued)) {
+                        if (admitNodeRequeue(queuedNode)) {
+                            pushNewNode(queuedNode);
+                        } else {
+                            std::uint8_t rollbackExpected = Queued;
+                            const bool resetToIdle = nodeState[queuedNode].compare_exchange_strong(rollbackExpected, Idle);
+                            assert(resetToIdle);
+                            tlx::unused(resetToIdle);
+                        }
+                        return;
+                    }
+                    state = expected;
+                } else if (state == Processing) {
+                    std::uint8_t expected = Processing;
+                    if (nodeState[queuedNode].compare_exchange_strong(expected, Reprocess)) {
+                        return;
+                    }
+                    state = expected;
+                } else {
+                    return;
+                }
+            }
+        };
+
+        auto finishProcessingNode = [&](node processedNode) {
+            uint8_t expected = Processing;
+            if (nodeState[processedNode].compare_exchange_strong(expected, Idle)) {
+                return;
+            }
+            assert(expected == Reprocess);
+
+            if (!admitNodeRequeue(processedNode)) {
+                expected = Reprocess;
+                const bool resetToIdle = nodeState[processedNode].compare_exchange_strong(expected, Idle);
+                assert(resetToIdle);
+                tlx::unused(resetToIdle);
+                return;
+            }
+
+            expected = Reprocess;
+            const bool markedQueued = nodeState[processedNode].compare_exchange_strong(expected, Queued);
+            assert(markedQueued);
+            tlx::unused(markedQueued);
+            pushNewNode(processedNode);
+        };
+
         int start = tshare * order[omp_get_thread_num()];
         int end = (1 + order[omp_get_thread_num()]) * tshare;
 
         for (int i = start; i < end; i++) {
             if (graph.hasNode(i)) {
                 currentNodes.push_back(i);
-                inQueue[i].store(true);
+                nodeState[i].store(Queued);
             }
         }
         if (random)
@@ -428,7 +550,12 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     }
                     waitingForResize--;
                 }
-                assert(inQueue[u]);
+
+                std::uint8_t expectedState = Queued;
+                const bool startedProcessing = nodeState[u].compare_exchange_strong(expectedState, Processing);
+                assert(startedProcessing);
+                tlx::unused(startedProcessing);
+
                 index currentCommunity = result[u];
                 double maxDelta = std::numeric_limits<double>::lowest();
                 index bestCommunity = none;
@@ -453,8 +580,10 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     degree += ew; // keep track of the nodes degree. Loops count twice
                 });
 
-                if (pointers.empty())
+                if (pointers.empty()) {
+                    finishProcessingNode(u);
                     continue;
+                }
 
                 double singletonScore = scoreCommunity(0.0, degree, 0.0, nodeMass, 0);
 
@@ -494,73 +623,57 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     }
 
                     if (acceptedMove) {
-                    const int tid = omp_get_thread_num();
-                    moved[tid]++;
-                    if (singletonMove) { // move node to empty community
-                        singleton++;
-                        movedToSingleton[tid]++;
-                        bestCommunity = upperBound++;
-                        if (bestCommunity >= communityVolumes.size()) {
-                            // Wait until all other threads yielded, then increase vector size
-                            bool expected = false;
-                            if (resize.compare_exchange_strong(expected, true)) {
-                                vectorSize += VECTOR_OVERSIZE;
-                                while (waitingForResize < tcount - 1) {
-                                    std::this_thread::yield();
+                        const int tid = omp_get_thread_num();
+                        moved[tid]++;
+
+                        if (singletonMove) { // move node to empty community
+                            singleton++;
+                            movedToSingleton[tid]++;
+                            bestCommunity = upperBound++;
+                            if (bestCommunity >= communityVolumes.size()) {
+                                // Wait until all other threads yielded, then increase vector size
+                                bool expected = false;
+                                if (resize.compare_exchange_strong(expected, true)) {
+                                    vectorSize += VECTOR_OVERSIZE;
+                                    while (waitingForResize < tcount - 1) {
+                                        std::this_thread::yield();
+                                    }
+                                    // all other threads are yielding, so resize is fine
+                                    communityVolumes.resize(vectorSize);
+                                    communitySizes.resize(vectorSize);
+                                    expected = true;
+                                    resize.compare_exchange_strong(expected, false);
+                                } else {
+                                    waitingForResize++;
+                                    while (resize) {
+                                        std::this_thread::yield();
+                                    }
+                                    waitingForResize--;
                                 }
-                                // all other threads are yielding, so resize is fine
-                                communityVolumes.resize(vectorSize);
-                                communitySizes.resize(vectorSize);
-                                expected = true;
-                                resize.compare_exchange_strong(expected, false);
-                            } else {
-                                waitingForResize++;
-                                while (resize) {
-                                    std::this_thread::yield();
-                                }
-                                waitingForResize--;
                             }
                         }
-                    }
-                    gainMarginSum[tid] += gainMargin;
-                    gainMarginMin[tid] = std::min(gainMarginMin[tid], gainMargin);
-                    gainMarginMax[tid] = std::max(gainMarginMax[tid], gainMargin);
-                    result[u] = bestCommunity;
+                        gainMarginSum[tid] += gainMargin;
+                        gainMarginMin[tid] = std::min(gainMarginMin[tid], gainMargin);
+                        gainMarginMax[tid] = std::max(gainMarginMax[tid], gainMargin);
+                        result[u] = bestCommunity;
 #pragma omp atomic
-                    communityVolumes[bestCommunity] += degree;
+                        communityVolumes[bestCommunity] += degree;
 #pragma omp atomic
-                    communityVolumes[currentCommunity] -= degree;
+                        communityVolumes[currentCommunity] -= degree;
 #pragma omp atomic
-                    communitySizes[bestCommunity] += nodeMass;
+                        communitySizes[bestCommunity] += nodeMass;
 #pragma omp atomic
-                    communitySizes[currentCommunity] -= nodeMass;
-                    changed = true;
-                    bool expected = true;
-                    inQueue[u].compare_exchange_strong(expected, false);
-                    assert(expected);
-                    graph.forNeighborsOf(u, [&](node neighbor, edgeweight) {
-                        // Only add the node to the queue if it's not already
-                        // in it, and it's not the Node we're currently moving
-                        if (result[neighbor] != bestCommunity && neighbor != u) {
-                            expected = false;
-                            if (inQueue[neighbor].compare_exchange_strong(expected, true)) {
-                                newNodes.push_back(neighbor);
-                                // push new nodes to the queue in WORKING_SIZE steps
-                                if (newNodes.size() == WORKING_SIZE) {
-                                    qlock.lock();
-                                    queue.emplace(std::move(newNodes));
-                                    qlock.unlock();
-                                    // Notify threads that new is available
-                                    workAvailable.notify_all();
-                                    newNodes.clear();
-                                    newNodes.reserve(WORKING_SIZE);
-                                }
-                                assert(!expected);
+                        communitySizes[currentCommunity] -= nodeMass;
+                        changed = true;
+    
+                        graph.forNeighborsOf(u, [&](node neighbor, edgeweight) {
+                            if (neighbor != u) {
+                                scheduleNode(neighbor);
                             }
-                        }
-                    });
+                        });
                     } // if (acceptedMove)
                 }
+                finishProcessingNode(u);
             }
 
             // queue check/wait
@@ -603,13 +716,23 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
     result.setUpperBound(upperBound);
     assert(queue.empty());
     assert(waitingForNodes == tcount);
-    count totalMoved = std::accumulate(moved.begin(), moved.end(), (count)0);
+
+    const count totalMoved = std::accumulate(moved.begin(), moved.end(), (count)0);
+    
+    const count totalWorked =
+        std::accumulate(totalNodesPerThread.begin(), totalNodesPerThread.end(),
+                        static_cast<count>(0));
+    
+    const count totalRequeuesBlockedByNodeLimit =
+        std::accumulate(requeuesBlockedByNodeLimit.begin(),
+                        requeuesBlockedByNodeLimit.end(), static_cast<count>(0));
+
+    
     if (Aux::Log::isLogLevelEnabled(Aux::Log::LogLevel::DEBUG)) {
-        count totalWorked =
-            std::accumulate(totalNodesPerThread.begin(), totalNodesPerThread.end(), (count)0);
         tlx::unused(totalWorked);
         DEBUG("Total worked: ", totalWorked, " Total moved: ", totalMoved,
-              " moved to singleton community: ", singleton);
+              " Moved to singleton community: ", singleton,
+              " Requeues blocked by node limit: ", totalRequeuesBlockedByNodeLimit);
     }
     MoveStats stats;
     stats.moved = totalMoved;
@@ -636,6 +759,15 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
 
 template <typename GraphType>
 Partition ParallelLeidenView::parallelRefine(const GraphType &graph) {
+    bool ignoredRefineMadeChanges = false;
+    return parallelRefine(graph, ignoredRefineMadeChanges);
+}
+
+template <typename GraphType>
+Partition ParallelLeidenView::parallelRefine(const GraphType &graph, bool &refineMadeChanges) {
+    std::atomic<bool> anyRefinementChanges{false};
+    refineMadeChanges = false;
+
     Partition refined(graph.numberOfNodes());
     refined.allToSingletons();
     DEBUG("Starting refinement with ", result.numberOfSubsets(), " partitions");
@@ -833,6 +965,11 @@ Partition ParallelLeidenView::parallelRefine(const GraphType &graph) {
                 }
                 singleton[bestC] = false;
                 refined[u] = bestC;
+
+                // This is the only operation that changes `refined` from
+                // the singleton partition created at the start of the function.
+                anyRefinementChanges.store(true);
+
                 refinedVolumes[bestC] += degree;
                 refinedSizes[bestC] += subsetSize;
                 updateCut();
@@ -845,6 +982,8 @@ Partition ParallelLeidenView::parallelRefine(const GraphType &graph) {
             locks[u].unlock();
         }
     }
+
+    refineMadeChanges = anyRefinementChanges.load();
 
     DEBUG("Ending refinement with ", refined.numberOfSubsets(), " partitions");
     return refined;
@@ -860,5 +999,7 @@ ParallelLeidenView::parallelMove<CoarsenedGraphView>(const CoarsenedGraphView &g
 template Partition ParallelLeidenView::parallelRefine<Graph>(const Graph &graph);
 template Partition
 ParallelLeidenView::parallelRefine<CoarsenedGraphView>(const CoarsenedGraphView &graph);
+template Partition
+ParallelLeidenView::parallelRefine<CoarsenedGraphView>(const CoarsenedGraphView &graph, bool &refineMadeChanges);
 
 } // namespace NetworKit
