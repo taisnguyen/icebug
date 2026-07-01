@@ -52,11 +52,11 @@ ParallelLeidenView::ParallelLeidenView(const Graph &graph, int iterations, bool 
             // Keep default if parsing fails.
         }
     }
-    if (const char *maxRequeuesPerNodeEnv = std::getenv("ICEBUG_LEIDEN_MAX_REQUEUES_PER_NODE")) {
+    if (const char *maxMovesPerNodeEnv = std::getenv("ICEBUG_LEIDEN_MAX_MOVES_PER_NODE")) {
         try {
-            const int parsed = std::stoi(maxRequeuesPerNodeEnv);
+            const int parsed = std::stoi(maxMovesPerNodeEnv);
             if (parsed > 0) {
-                maxRequeuesPerNode = parsed;
+                maxMovesPerNode = parsed;
             }
         } catch (...) {
             // Keep default if parsing fails.
@@ -177,7 +177,7 @@ void ParallelLeidenView::run() {
         changed = false;
         INFO("Using move gain epsilon=", std::setprecision(6), moveGainMarginEpsilon,
              " | max inner iterations=", maxInnerIterations,
-             " | max requeues per node=", maxRequeuesPerNode,
+             " | max moves per node=", maxMovesPerNode,
              " | vector oversize=", VECTOR_OVERSIZE,
              " | min community reduction=", minCommunityReduction);
 
@@ -385,7 +385,7 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
     std::vector<double> gainMarginMin(omp_get_max_threads(), std::numeric_limits<double>::max());
     std::vector<double> gainMarginMax(omp_get_max_threads(), std::numeric_limits<double>::lowest());
     std::vector<count> totalNodesPerThread(omp_get_max_threads(), 0);
-    std::vector<count> requeuesBlockedByNodeLimit(omp_get_max_threads(), 0);
+    std::vector<count> nodePassesSkippedByMoveLimit(omp_get_max_threads(), 0);
     std::atomic_int singleton(0);
 
     // Track whether nodes are idle, queued, currently processed, or need another pass after the
@@ -395,8 +395,8 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
         val.store(Idle);
     }
 
-    std::vector<std::atomic<std::uint32_t>> requeuesPerNode(graph.upperNodeIdBound());
-    for (auto &count : requeuesPerNode) {
+    std::vector<std::atomic<uint32_t>> movesPerNode(graph.upperNodeIdBound());
+    for (auto &count : movesPerNode) {
         count.store(0);
     }
 
@@ -438,22 +438,8 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
         std::unordered_map<index, double> cutWeights;
         std::vector<index> pointers;
 
-        auto admitNodeRequeue = [&](node candidate) {
-            std::uint32_t used = requeuesPerNode[candidate].load(std::memory_order_relaxed);
-
-            while (true) {
-                if (used >= maxRequeuesPerNode) {
-                    requeuesBlockedByNodeLimit[tid]++;
-                    return false;
-                }
-
-                if (requeuesPerNode[candidate].compare_exchange_weak(
-                        used, used + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
-                    return true;
-                }
-
-                // On CAS failure, `used` has been refreshed with the current value.
-            }
+        auto moveLimitReached = [&](node candidate) {
+            return movesPerNode[candidate].load() >= maxMovesPerNode;
         };
 
         auto pushNewNode = [&](node queuedNode) {
@@ -478,15 +464,7 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     std::uint8_t expected = Idle;
 
                     if (nodeState[queuedNode].compare_exchange_strong(expected, Queued)) {
-                        if (admitNodeRequeue(queuedNode)) {
-                            pushNewNode(queuedNode);
-                        } else {
-                            std::uint8_t rollbackExpected = Queued;
-                            const bool resetToIdle = nodeState[queuedNode].compare_exchange_strong(
-                                rollbackExpected, Idle);
-                            assert(resetToIdle);
-                            tlx::unused(resetToIdle);
-                        }
+                        pushNewNode(queuedNode);
                         return;
                     }
                     state = expected;
@@ -504,25 +482,18 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
 
         auto finishProcessingNode = [&](node processedNode) {
             uint8_t expected = Processing;
+
             if (nodeState[processedNode].compare_exchange_strong(expected, Idle)) {
                 return;
             }
+
             assert(expected == Reprocess);
 
-            if (!admitNodeRequeue(processedNode)) {
-                expected = Reprocess;
-                const bool resetToIdle =
-                    nodeState[processedNode].compare_exchange_strong(expected, Idle);
-                assert(resetToIdle);
-                tlx::unused(resetToIdle);
-                return;
-            }
-
             expected = Reprocess;
-            const bool markedQueued =
-                nodeState[processedNode].compare_exchange_strong(expected, Queued);
+            const bool markedQueued = nodeState[processedNode].compare_exchange_strong(expected, Queued);
             assert(markedQueued);
             tlx::unused(markedQueued);
+
             pushNewNode(processedNode);
         };
 
@@ -551,10 +522,15 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                 }
 
                 std::uint8_t expectedState = Queued;
-                const bool startedProcessing =
-                    nodeState[u].compare_exchange_strong(expectedState, Processing);
+                const bool startedProcessing = nodeState[u].compare_exchange_strong(expectedState, Processing);
                 assert(startedProcessing);
                 tlx::unused(startedProcessing);
+
+                if (moveLimitReached(u)) {
+                    nodePassesSkippedByMoveLimit[tid]++;
+                    finishProcessingNode(u);
+                    continue;
+                }
 
                 index currentCommunity = result[u];
                 double maxDelta = std::numeric_limits<double>::lowest();
@@ -625,6 +601,10 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
                     if (acceptedMove) {
                         const int tid = omp_get_thread_num();
                         moved[tid]++;
+
+                        const uint32_t previousMoves =
+                            movesPerNode[u].fetch_add(1, std::memory_order_relaxed);
+                        assert(previousMoves < maxMovesPerNode);
 
                         if (singletonMove) { // move node to empty community
                             singleton++;
@@ -722,15 +702,15 @@ ParallelLeidenView::MoveStats ParallelLeidenView::parallelMove(const GraphType &
     const count totalWorked = std::accumulate(totalNodesPerThread.begin(),
                                               totalNodesPerThread.end(), static_cast<count>(0));
 
-    const count totalRequeuesBlockedByNodeLimit =
-        std::accumulate(requeuesBlockedByNodeLimit.begin(), requeuesBlockedByNodeLimit.end(),
-                        static_cast<count>(0));
+    const count totalNodePassesSkippedByMoveLimit =
+        std::accumulate(nodePassesSkippedByMoveLimit.begin(),
+                        nodePassesSkippedByMoveLimit.end(), static_cast<count>(0));
 
     if (Aux::Log::isLogLevelEnabled(Aux::Log::LogLevel::DEBUG)) {
         tlx::unused(totalWorked);
         DEBUG("Total worked: ", totalWorked, " Total moved: ", totalMoved,
-              " Moved to singleton community: ", singleton,
-              " Requeues blocked by node limit: ", totalRequeuesBlockedByNodeLimit);
+            " Moved to singleton community: ", singleton,
+            " Node passes skipped by move limit: ", totalNodePassesSkippedByMoveLimit);
     }
     MoveStats stats;
     stats.moved = totalMoved;

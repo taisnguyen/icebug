@@ -209,7 +209,7 @@ private:
     int maxInnerIterations = 20;
 
     // Maximum moves per node within a Leiden iteration.
-    int maxRequeuesPerNode = 24;
+    int maxMovesPerNode = 20;
 
     // Optional convergence stop: minimum relative reduction in community count per inner iter.
     // 0.0 disables this criterion.
